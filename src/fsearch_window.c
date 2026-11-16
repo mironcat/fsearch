@@ -853,6 +853,130 @@ on_listview_row_is_selected(int row, gpointer user_data) {
     return FALSE;
 }
 
+enum {
+    DND_TARGET_URI_LIST,
+    DND_TARGET_TEXT_PLAIN,
+};
+
+typedef struct {
+    GPtrArray *uris;
+    GString *paths;
+} DragSelectionData;
+
+static void
+append_selection_to_drag_data(FsearchDatabaseEntry *entry, gpointer userdata) {
+    DragSelectionData *data = userdata;
+    g_autoptr(GString) path = db_entry_get_path_full(entry);
+
+    gchar *uri = g_filename_to_uri(path->str, NULL, NULL);
+    if (uri) {
+        g_ptr_array_add(data->uris, uri);
+    }
+
+    // Plain text fallback for applications which don't support text/uri-list.
+    g_string_append(data->paths, path->str);
+    g_string_append_c(data->paths, '\n');
+}
+
+static void
+on_drag_data_get(GtkWidget *widget,
+                 GdkDragContext *context,
+                 GtkSelectionData *selection_data,
+                 guint info,
+                 guint time,
+                 gpointer user_data) {
+    FsearchApplicationWindow *win = FSEARCH_APPLICATION_WINDOW(user_data);
+
+    DragSelectionData data = {
+        .uris = g_ptr_array_new_with_free_func(g_free),
+        .paths = g_string_new(NULL),
+    };
+    fsearch_application_window_selection_for_each(win, append_selection_to_drag_data, &data);
+
+    if (info == DND_TARGET_URI_LIST) {
+        g_ptr_array_add(data.uris, NULL);
+        gtk_selection_data_set_uris(selection_data, (gchar **)data.uris->pdata);
+    }
+    else if (info == DND_TARGET_TEXT_PLAIN) {
+        gtk_selection_data_set_text(selection_data, data.paths->str, (gint)data.paths->len);
+    }
+
+    g_ptr_array_unref(data.uris);
+    g_string_free(data.paths, TRUE);
+}
+
+static void
+on_drag(FsearchListView *lv, gdouble x, gdouble y, gpointer user_data) {
+    static const GtkTargetEntry targets[] = {
+        {"text/uri-list", 0, DND_TARGET_URI_LIST},
+        {"text/plain", 0, DND_TARGET_TEXT_PLAIN},
+    };
+
+    GtkTargetList *target_list = gtk_target_list_new(targets, G_N_ELEMENTS(targets));
+    GdkEvent *event = gtk_get_current_event();
+    gtk_drag_begin_with_coordinates(GTK_WIDGET(lv),
+                                    target_list,
+                                    GDK_ACTION_COPY,
+                                    GDK_BUTTON_PRIMARY,
+                                    event,
+                                    (gint)x,
+                                    (gint)y);
+    gtk_target_list_unref(target_list);
+    if (event) {
+        gdk_event_free(event);
+    }
+}
+
+static void
+on_drag_icon_drag_end(GdkDragContext *context, gpointer user_data) {
+    gtk_widget_destroy(GTK_WIDGET(user_data));
+}
+
+static void
+on_drag_begin(GtkWidget *widget, GdkDragContext *context, gpointer user_data) {
+    FsearchApplicationWindow *win = FSEARCH_APPLICATION_WINDOW(user_data);
+    const guint num_selected = fsearch_application_window_get_num_selected(win);
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 2);
+
+    GtkWidget *icon = gtk_image_new_from_icon_name("text-x-generic", GTK_ICON_SIZE_DND);
+    gtk_box_pack_start(GTK_BOX(box), icon, FALSE, FALSE, 0);
+
+    if (num_selected > 1) {
+        GtkWidget *label = gtk_label_new(NULL);
+        g_autofree gchar *text = g_strdup_printf("%u", num_selected);
+        gtk_label_set_text(GTK_LABEL(label), text);
+
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        pango_attr_list_insert(attrs, pango_attr_scale_new(1.15));
+        gtk_label_set_attributes(GTK_LABEL(label), attrs);
+        pango_attr_list_unref(attrs);
+
+        GtkCssProvider *provider = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(provider,
+                                        "label {"
+                                        "  color: #ffffff;"
+                                        "  background-color: alpha(#3584e4, 0.9);"
+                                        "  border-radius: 8px;"
+                                        "  padding: 0 5px;"
+                                        "}",
+                                        -1,
+                                        NULL);
+        gtk_style_context_add_provider(gtk_widget_get_style_context(label),
+                                       GTK_STYLE_PROVIDER(provider),
+                                       GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(provider);
+
+        gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    }
+
+    gtk_widget_show_all(box);
+    gtk_drag_set_icon_widget(context, box, 8, 8);
+    g_signal_connect(context, "drag-end", G_CALLBACK(on_drag_icon_drag_end), box);
+}
+
 static void
 fsearch_application_window_init_overlays(FsearchApplicationWindow *win) {
     g_assert(FSEARCH_IS_APPLICATION_WINDOW(win));
@@ -922,6 +1046,9 @@ fsearch_application_window_init_listview(FsearchApplicationWindow *win) {
     g_signal_connect_object(list_view, "row-popup", G_CALLBACK(on_fsearch_list_view_popup), win, G_CONNECT_AFTER);
     g_signal_connect_object(list_view, "row-activated", G_CALLBACK(on_fsearch_list_view_row_activated), win, G_CONNECT_AFTER);
     g_signal_connect(list_view, "key-press-event", G_CALLBACK(on_listview_key_press_event), win);
+    g_signal_connect(list_view, "drag-selection", G_CALLBACK(on_drag), win);
+    g_signal_connect(list_view, "drag-data-get", G_CALLBACK(on_drag_data_get), win);
+    g_signal_connect(list_view, "drag-begin", G_CALLBACK(on_drag_begin), win);
 
     win->result_view->list_view = list_view;
 }

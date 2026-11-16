@@ -494,6 +494,26 @@ fsearch_result_view_draw_row(FsearchResultView *result_view,
         pango_layout_set_alignment(layout, column->alignment);
         pango_layout_set_ellipsize(layout, column->ellipsize_mode);
         gtk_render_layout(context, cr, x + ROW_PADDING_X + dx, rect->y + ROW_PADDING_Y, layout);
+
+        // Remember where the file name (icon + text) is, so a mouse drag starting inside that
+        // area becomes a drag and drop operation instead of a rubberband selection.
+        if (column->type == DATABASE_INDEX_PROPERTY_NAME) {
+            int text_width = 0;
+            pango_layout_get_pixel_size(layout, &text_width, NULL);
+            gint drag_start_x;
+            gint drag_end_x;
+            if (right_to_left_text) {
+                // The text is right aligned and the icon is rendered on the right side.
+                const gint layout_right = x + column->effective_width - ROW_PADDING_X - dw;
+                drag_start_x = MAX(layout_right - text_width, x);
+                drag_end_x = x + column->effective_width;
+            }
+            else {
+                drag_start_x = x;
+                drag_end_x = MIN(x + ROW_PADDING_X + dx + text_width, x + column->effective_width);
+            }
+            fsearch_list_view_set_row_drag_zone(result_view->list_view, row, drag_start_x, drag_end_x);
+        }
         x += column->effective_width;
         cairo_restore(cr);
     }
