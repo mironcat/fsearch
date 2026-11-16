@@ -26,6 +26,11 @@ typedef enum {
     NUM_RUBBERBAND_SELECT,
 } FsearchListviewRubberbandState;
 
+typedef struct {
+    gint start_x;
+    gint end_x;
+} FsearchListViewDragZone;
+
 struct _FsearchListView {
     GtkContainer parent_instance;
 
@@ -107,14 +112,21 @@ struct _FsearchListView {
     FsearchListViewNumSelectedFunc num_selected_func;
     gpointer selection_user_data;
 
-    gboolean drag_and_drop_started;
-    gboolean single_row_selected;
+    // TRUE while a drag gesture which started on a draggable part of a row may turn into a
+    // drag and drop operation.
+    gboolean drag_possible;
+    // TRUE once drag and drop has been initiated for the current drag gesture.
+    gboolean drag_initiated;
+    // TRUE if the selection has to be collapsed to the clicked row when the button is released
+    // without starting a drag and drop operation.
+    gboolean collapse_selection_on_release;
+    gdouble drag_start_x;
+    gdouble drag_start_y;
 
-    // An array of end_x_position for each row. For unselected rows:
-    // Starting a mouse drag inside the range of 0 to "end x position" will start a drag & drop operation
-    // Starting a mouse drag outside that rage will start a rubberband selection
-    gint *row_drag_end_position_array;
-    guint row_drag_end_position_array_size;
+    // The horizontal area of a row which starts a drag and drop operation instead of a
+    // rubberband selection when dragging an unselected row.
+    FsearchListViewDragZone *row_drag_zone_array;
+    guint row_drag_zone_array_size;
 };
 
 enum {
@@ -746,9 +758,10 @@ fsearch_list_view_get_selection_modifiers(FsearchListView *view, gboolean *modif
     }
 }
 
-static gint
-get_row_drag_end_position(FsearchListView *view, int32_t row) {
-    return view->row_drag_end_position_array[row % view->row_drag_end_position_array_size];
+static gboolean
+is_row_drag_position(FsearchListView *view, int32_t row, gdouble x) {
+    const guint idx = row % view->row_drag_zone_array_size;
+    return x >= view->row_drag_zone_array[idx].start_x && x <= view->row_drag_zone_array[idx].end_x;
 }
 
 static void
@@ -764,6 +777,9 @@ on_fsearch_list_view_multi_press_gesture_pressed(GtkGestureMultiPress *gesture,
         gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
         return;
     }
+
+    view->drag_possible = FALSE;
+    view->collapse_selection_on_release = FALSE;
 
     // gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 
@@ -818,10 +834,10 @@ on_fsearch_list_view_multi_press_gesture_pressed(GtkGestureMultiPress *gesture,
                 fsearch_list_view_selection_toggle_silent(view, row_idx);
             }
             else {
-                gboolean is_selected = fsearch_list_view_is_selected(view, row_idx);
+                const gboolean is_selected = fsearch_list_view_is_selected(view, row_idx);
 
+                view->cursor_idx = row_idx;
                 if (!is_selected) {
-                    view->cursor_idx = row_idx;
                     fsearch_list_view_selection_clear_silent(view);
                     fsearch_list_view_selection_toggle_silent(view, row_idx);
                     if (view->single_click_activate) {
@@ -837,16 +853,18 @@ on_fsearch_list_view_multi_press_gesture_pressed(GtkGestureMultiPress *gesture,
                 }
 
                 if (!view->single_click_activate) {
-                    FsearchListViewColumn *col = fsearch_list_view_get_col_for_x_view(view, x_view);
-                    if (col) {
-                        // Dragging only starts when the press lands on the name (icon + text) of an unselected row,
-                        // or anywhere on an already selected row. Otherwise it's a rubberband selection.
-                        const gint drag_end_x = get_row_drag_end_position(view, row_idx);
-                        view->drag_and_drop_started = (x_view < drag_end_x) || is_selected;
-                    }
+                    // A drag which starts on an already selected row always drags the whole
+                    // selection. For unselected rows only the file name (icon + text) acts as
+                    // a drag handle, everything else starts a rubberband selection.
+                    view->drag_possible = is_selected || is_row_drag_position(view, row_idx, x_view);
+                    // If the row was already selected a plain click (without dragging) has to
+                    // collapse the selection to this row. This is done on button release so a
+                    // drag and drop operation can still move the whole selection.
+                    view->collapse_selection_on_release = is_selected;
                 }
             }
             fsearch_list_view_selection_changed(view);
+            fsearch_list_view_scroll_row_into_view(view, view->cursor_idx);
         }
 
         if (n_press == 2 && !view->single_click_activate) {
@@ -888,43 +906,38 @@ on_fsearch_list_view_multi_press_gesture_released(GtkGestureMultiPress *gesture,
                                                   FsearchListView *view) {
     guint button_pressed = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
 
-    view->drag_and_drop_started = FALSE;
-
     if (button_pressed > 3) {
         return;
     }
 
-    // Selection of a single row is done on mouse release so we can identify single row selection vs start of drag and drop operation
-    // If the release is done after selection extention or modification, or as part of
-    // a rubberband selection, we don't reset the selection to a single row.
+    view->drag_possible = FALSE;
+    view->drag_initiated = FALSE;
 
-    if(!view->single_row_selected)
+    // A click on an already selected row only collapses the selection when the button is
+    // released without starting a drag and drop operation. This way multiple selected rows
+    // can still be dragged as a whole.
+    if (!view->collapse_selection_on_release) {
         return;
+    }
+    view->collapse_selection_on_release = FALSE;
 
     gboolean modify_selection;
     gboolean extend_selection;
-
     fsearch_list_view_get_selection_modifiers(view, &modify_selection, &extend_selection);
-
-    if(modify_selection || extend_selection)
+    if (modify_selection || extend_selection) {
         return;
+    }
 
-    gint row_idx = fsearch_list_view_get_row_idx_for_y_view(view, y);
+    const gint row_idx = fsearch_list_view_get_row_idx_for_y_view(view, y);
+    if (!is_row_idx_valid(view, row_idx)) {
+        return;
+    }
+
     view->cursor_idx = row_idx;
     fsearch_list_view_selection_clear_silent(view);
     fsearch_list_view_selection_toggle_silent(view, row_idx);
-    if (view->single_click_activate) {
-        FsearchListViewColumn *col = fsearch_list_view_get_col_for_x_view(view, x);
-        if (col) {
-            g_signal_emit(view,
-                            signals[FSEARCH_LIST_VIEW_SIGNAL_ROW_ACTIVATED],
-                            0,
-                            col->type,
-                            get_row_idx_for_sort_type(view, row_idx));
-        }
-    }
-
     fsearch_list_view_selection_changed(view);
+    fsearch_list_view_scroll_row_into_view(view, view->cursor_idx);
     gtk_widget_queue_draw(GTK_WIDGET(view));
 }
 
@@ -935,7 +948,8 @@ on_fsearch_list_view_bin_drag_gesture_end(GtkGestureDrag *gesture,
                                           FsearchListView *view) {
     //  GdkEventSequence *sequence = gtk_gesture_single_get_current_sequence(GTK_GESTURE_SINGLE(gesture));
 
-    view->single_row_selected = view->rubberband_start_idx == view->rubberband_end_idx;
+    view->drag_possible = FALSE;
+    view->drag_initiated = FALSE;
 
     if (view->rubberband_drag_mode) {
         view->rubberband_drag_mode = FALSE;
@@ -948,7 +962,6 @@ on_fsearch_list_view_bin_drag_gesture_end(GtkGestureDrag *gesture,
         view->rubberband_end_idx = UNSET_ROW;
         view->rubberband_extend = FALSE;
         view->rubberband_modify = FALSE;
-        view->drag_and_drop_started = FALSE;
         gtk_widget_queue_draw(GTK_WIDGET(view));
     }
 }
@@ -1161,9 +1174,18 @@ on_fsearch_list_view_bin_drag_gesture_update(GtkGestureDrag *gesture,
     //     return;
     // }
 
-    if (view->drag_and_drop_started) {
-        view->drag_and_drop_started = FALSE;
-        g_signal_emit(view, signals[FSEARCH_LIST_VIEW_SIGNAL_DRAG], 0);
+    if (view->drag_possible) {
+        if (!view->drag_initiated) {
+            view->drag_initiated = TRUE;
+            // The drag and drop operation will handle the button release. Don't collapse the
+            // selection to a single row in that case.
+            view->collapse_selection_on_release = FALSE;
+            g_signal_emit(view,
+                          signals[FSEARCH_LIST_VIEW_SIGNAL_DRAG],
+                          0,
+                          view->drag_start_x,
+                          view->drag_start_y);
+        }
         return;
     }
 
@@ -1183,6 +1205,16 @@ on_fsearch_list_view_bin_drag_gesture_begin(GtkGestureDrag *gesture,
     if (start_y_view > view->header_height && !view->single_click_activate) {
         if (!gtk_widget_has_focus(GTK_WIDGET(view))) {
             gtk_widget_grab_focus(GTK_WIDGET(view));
+        }
+
+        view->drag_start_x = start_x_view;
+        view->drag_start_y = start_y_view;
+
+        if (view->drag_possible) {
+            // The drag started on a draggable part of the row, so this is a drag and drop
+            // operation and not a rubberband selection.
+            gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+            return;
         }
 
         view->rubberband_start_x_canvas = start_x_view + get_hscroll_pos(view);
@@ -1962,7 +1994,7 @@ static void
 fsearch_list_view_finalize(GObject *obj) {
     FsearchListView *view = FSEARCH_LIST_VIEW(obj);
 
-    g_clear_pointer(&view->row_drag_end_position_array, g_free);
+    g_clear_pointer(&view->row_drag_zone_array, g_free);
 
     G_OBJECT_CLASS(fsearch_list_view_parent_class)->finalize(obj);
 }
@@ -2016,7 +2048,7 @@ fsearch_list_view_class_init(FsearchListViewClass *klass) {
                                                                    G_TYPE_INT);
 
     signals[FSEARCH_LIST_VIEW_SIGNAL_DRAG] =
-        g_signal_new("on-drag",
+        g_signal_new("drag-selection",
                G_TYPE_FROM_CLASS(klass),
                G_SIGNAL_RUN_LAST,
                0,
@@ -2024,7 +2056,9 @@ fsearch_list_view_class_init(FsearchListViewClass *klass) {
                NULL,
                NULL,
                G_TYPE_NONE,
-               0);
+               2,
+               G_TYPE_DOUBLE,
+               G_TYPE_DOUBLE);
 
 #if GTK_CHECK_VERSION(3, 20, 0)
     gtk_widget_class_set_css_name(widget_class, "treeview");
@@ -2100,8 +2134,8 @@ fsearch_list_view_init(FsearchListView *view) {
     gtk_style_context_add_class(style, GTK_STYLE_CLASS_LINKED);
     // gtk_style_context_add_class(style, GTK_STYLE_CLASS_CELL);
 
-    view->row_drag_end_position_array_size = DEFAULT_MAX_ROWS_IN_VIEWPORT;
-    view->row_drag_end_position_array = g_new0(gint, view->row_drag_end_position_array_size);
+    view->row_drag_zone_array_size = DEFAULT_MAX_ROWS_IN_VIEWPORT;
+    view->row_drag_zone_array = g_new0(FsearchListViewDragZone, view->row_drag_zone_array_size);
 }
 
 FsearchListView *
@@ -2460,13 +2494,17 @@ fsearch_list_view_set_single_click_activate(FsearchListView *view, gboolean valu
 }
 
 void
-fsearch_list_view_set_row_drag_end_position(FsearchListView *view, int32_t row, gint end_x) {
-    const guint num_rows_in_view = fsearch_list_view_num_rows_for_view_height(view) * 2;
-    if (num_rows_in_view > view->row_drag_end_position_array_size) {
-        view->row_drag_end_position_array_size = num_rows_in_view;
-        view->row_drag_end_position_array = g_renew(gint, view->row_drag_end_position_array, num_rows_in_view);
+fsearch_list_view_set_row_drag_zone(FsearchListView *view, int32_t row, gint start_x, gint end_x) {
+    const gint num_rows_in_view = fsearch_list_view_num_rows_for_view_height(view);
+    const guint needed_size = num_rows_in_view > 0 ? (guint)num_rows_in_view * 2 : 0;
+    if (needed_size > view->row_drag_zone_array_size) {
+        view->row_drag_zone_array_size = needed_size;
+        view->row_drag_zone_array =
+            g_renew(FsearchListViewDragZone, view->row_drag_zone_array, needed_size);
     }
-    view->row_drag_end_position_array[row % view->row_drag_end_position_array_size] = end_x;
+    FsearchListViewDragZone *zone = &view->row_drag_zone_array[row % view->row_drag_zone_array_size];
+    zone->start_x = start_x;
+    zone->end_x = end_x;
 }
 
 FsearchListViewColumn *

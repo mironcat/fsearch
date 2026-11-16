@@ -157,4 +157,4 @@ gboolean
 fsearch_list_view_redraw_row(FsearchListView *view, int row_idx);
 
 void
-fsearch_list_view_set_row_drag_end_position(FsearchListView *view, int32_t row, gint end_x);
+fsearch_list_view_set_row_drag_zone(FsearchListView *view, int32_t row, gint start_x, gint end_x);

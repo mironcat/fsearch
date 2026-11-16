@@ -857,38 +857,78 @@ on_listview_row_is_selected(int row, gpointer user_data) {
     return FALSE;
 }
 
+enum {
+    DND_TARGET_URI_LIST,
+    DND_TARGET_TEXT_PLAIN,
+};
+
+typedef struct {
+    GPtrArray *uris;
+    GString *paths;
+} DragSelectionData;
+
 static void
-append_path_to_uri_list(FsearchDatabaseEntry *entry, gpointer userdata) {
-    GString *uri_list = (GString *)userdata;
+append_selection_to_drag_data(FsearchDatabaseEntry *entry, gpointer userdata) {
+    DragSelectionData *data = userdata;
     g_autoptr(GString) path = db_entry_get_path_full(entry);
+
     gchar *uri = g_filename_to_uri(path->str, NULL, NULL);
-    g_string_append(uri_list, uri);
-    g_string_append(uri_list, "\r\n");
-    g_free(uri);
+    if (uri) {
+        g_ptr_array_add(data->uris, uri);
+    }
+
+    // Plain text fallback for applications which don't support text/uri-list.
+    g_string_append(data->paths, path->str);
+    g_string_append_c(data->paths, '\n');
 }
 
 static void
-on_drag_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *selection_data, guint info, guint time, gpointer user_data) {
+on_drag_data_get(GtkWidget *widget,
+                 GdkDragContext *context,
+                 GtkSelectionData *selection_data,
+                 guint info,
+                 guint time,
+                 gpointer user_data) {
     FsearchApplicationWindow *win = FSEARCH_APPLICATION_WINDOW(user_data);
 
-    GString *uri_list = g_string_new(NULL);
-    fsearch_application_window_selection_for_each(win, append_path_to_uri_list, uri_list);
+    DragSelectionData data = {
+        .uris = g_ptr_array_new_with_free_func(g_free),
+        .paths = g_string_new(NULL),
+    };
+    fsearch_application_window_selection_for_each(win, append_selection_to_drag_data, &data);
 
-    gtk_selection_data_set(selection_data,
-                           gdk_atom_intern("text/uri-list", TRUE),
-                           8,
-                           (const guchar *)uri_list->str,
-                           uri_list->len);
+    if (info == DND_TARGET_URI_LIST) {
+        g_ptr_array_add(data.uris, NULL);
+        gtk_selection_data_set_uris(selection_data, (gchar **)data.uris->pdata);
+    }
+    else if (info == DND_TARGET_TEXT_PLAIN) {
+        gtk_selection_data_set_text(selection_data, data.paths->str, (gint)data.paths->len);
+    }
 
-    g_string_free(uri_list, TRUE);
+    g_ptr_array_unref(data.uris);
+    g_string_free(data.paths, TRUE);
 }
 
 static void
-on_drag(FsearchListView *lv, gpointer user_data) {
-    GtkTargetEntry targets[] = {{"text/uri-list", 0, 0}};
+on_drag(FsearchListView *lv, gdouble x, gdouble y, gpointer user_data) {
+    static const GtkTargetEntry targets[] = {
+        {"text/uri-list", 0, DND_TARGET_URI_LIST},
+        {"text/plain", 0, DND_TARGET_TEXT_PLAIN},
+    };
+
     GtkTargetList *target_list = gtk_target_list_new(targets, G_N_ELEMENTS(targets));
-    gtk_drag_begin_with_coordinates(GTK_WIDGET(lv), target_list, GDK_ACTION_COPY, GDK_BUTTON_PRIMARY, NULL, -1, -1);
+    GdkEvent *event = gtk_get_current_event();
+    gtk_drag_begin_with_coordinates(GTK_WIDGET(lv),
+                                    target_list,
+                                    GDK_ACTION_COPY,
+                                    GDK_BUTTON_PRIMARY,
+                                    event,
+                                    (gint)x,
+                                    (gint)y);
     gtk_target_list_unref(target_list);
+    if (event) {
+        gdk_event_free(event);
+    }
 }
 
 static void
@@ -960,7 +1000,7 @@ fsearch_application_window_init_listview(FsearchApplicationWindow *win) {
     g_signal_connect_object(list_view, "row-popup", G_CALLBACK(on_fsearch_list_view_popup), win, G_CONNECT_AFTER);
     g_signal_connect_object(list_view, "row-activated", G_CALLBACK(on_fsearch_list_view_row_activated), win, G_CONNECT_AFTER);
     g_signal_connect(list_view, "key-press-event", G_CALLBACK(on_listview_key_press_event), win);
-    g_signal_connect(list_view, "on-drag", G_CALLBACK(on_drag), win);
+    g_signal_connect(list_view, "drag-selection", G_CALLBACK(on_drag), win);
     g_signal_connect(list_view, "drag-data-get", G_CALLBACK(on_drag_data_get), win);
 
     win->result_view->list_view = list_view;
